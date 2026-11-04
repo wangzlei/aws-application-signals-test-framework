@@ -114,6 +114,7 @@ Resources:
             - cloudformation:DescribeStackEvents
             - cloudformation:DescribeStackResources
             - cloudformation:GetTemplate
+            - cloudformation:UpdateTerminationProtection
             Resource:
               Fn::Sub: arn:aws:cloudformation:${ClusterRegion}:${AWS::AccountId}:stack/eksctl-${ClusterName}-addon-iamserviceaccount-*/*
           - Sid: EksctlListStacks

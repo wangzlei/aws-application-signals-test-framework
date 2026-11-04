@@ -43,7 +43,8 @@
         "cloudformation:DescribeStacks",
         "cloudformation:DescribeStackEvents",
         "cloudformation:DescribeStackResources",
-        "cloudformation:GetTemplate"
+        "cloudformation:GetTemplate",
+        "cloudformation:UpdateTerminationProtection"
       ],
       "Resource": "arn:aws:cloudformation:us-east-2:292779133546:stack/eksctl-guard-test-addon-iamserviceaccount-*/*"
     },
