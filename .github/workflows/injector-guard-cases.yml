@@ -138,7 +138,7 @@ jobs:
         run: |
           . .github/workflows/util/execute_and_retry.sh
           execute_and_retry 3 \
-            "enablement-script/enable-app-signals.sh ${CLUSTER_NAME} ${AWS_REGION} ${NAMESPACE}" \
+            "${GITHUB_WORKSPACE}/enablement-script/enable-app-signals.sh ${CLUSTER_NAME} ${AWS_REGION} ${NAMESPACE}" \
             "enablement-script/clean-app-signals.sh ${CLUSTER_NAME} ${AWS_REGION} ${NAMESPACE} && aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}" \
             60
           aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
