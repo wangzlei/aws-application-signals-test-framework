@@ -78,6 +78,11 @@ on:
         required: false
         type: string
         default: 'injector-mode'
+      flatten-trace-metadata:
+        description: 'The account sends traces to CloudWatch Logs (Transaction Search), so X-Ray segments carry metadata without the "default" namespace'
+        required: false
+        type: boolean
+        default: true
     secrets:
       INJECTOR_CI_ROLE_ARN:
         required: true
@@ -418,6 +423,10 @@ jobs:
           cleanup: "./gradlew clean"
           max_retry: 3
           sleep_time: 60
+
+      - name: Adapt the expected trace templates to Transaction Search
+        if: ${{ inputs.flatten-trace-metadata }}
+        run: python3 injector-ci/flatten_trace_metadata.py validator/src/main/resources/expected-data-template/python/eks/*-trace.mustache
 
       # Validation for application signals telemetry data
       - name: Call endpoint and validate generated EMF logs
