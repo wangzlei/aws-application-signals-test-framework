@@ -36,6 +36,8 @@ def flatten(node):
                     k = k[len("otel.resource."):]
                 renamed[k] = v
             value = renamed
+            if not value:
+                continue  # nothing left to compare; an empty object would be compared as a leaf
         if key == "aws" and isinstance(out.get("aws"), dict) and isinstance(value, dict):
             out["aws"].update(value)
             continue
