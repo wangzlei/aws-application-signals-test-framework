@@ -1,0 +1,529 @@
+## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+## SPDX-License-Identifier: Apache-2.0
+
+# Reusable workflow: the Python EKS Application Signals test (python-eks-test.yml) adapted for the
+# Injector injection mode. Differences from python-eks-test.yml:
+#   - the add-on is installed from a helm-charts git repository/ref (e.g. a fork) instead of the EKS add-on,
+#     with a given operator image and manager.instrumentationInjectionMode,
+#   - the Python SDK image under test is patched in as python-eks-test.yml does for the Python repository,
+#   - AWS access uses one role ARN from the INJECTOR_CI_ROLE_ARN secret; sample-app images are inputs,
+#   - all sample-app pods are pinned to the requested CPU architecture,
+#   - after deployment it checks that the Python app got the expected injection (LD_PRELOAD or not).
+# It is meant to be called from injector-e2e.yml.
+name: Python EKS Injector Use Case
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        description: 'Runner for this workflow''s jobs: a label, or a JSON array of labels (e.g. CodeBuild-hosted runner labels).'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      aws-region:
+        required: true
+        type: string
+      test-cluster-name:
+        required: true
+        type: string
+      caller-workflow-name:
+        required: false
+        type: string
+        default: 'injector-e2e'
+      python-version:
+        description: "Currently support version 3.10, 3.11, 3.12, 3.13, 3.14"
+        required: false
+        type: string
+        default: '3.10'
+      helm-chart-repo:
+        description: 'git URL of the helm-charts repository to install the add-on from'
+        required: false
+        type: string
+        default: 'https://github.com/wangzlei/helm-charts.git'
+      helm-chart-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+      operator-image:
+        description: 'Operator image URI (the Injector-mode build)'
+        required: true
+        type: string
+      python-sdk-image:
+        description: 'ADOT Python auto-instrumentation image URI under test'
+        required: true
+        type: string
+      injection-mode:
+        description: 'manager.instrumentationInjectionMode: old | injector | comma-separated languages'
+        required: true
+        type: string
+      arch:
+        description: 'CPU architecture of the nodes to run the sample apps on: amd64 | arm64'
+        required: false
+        type: string
+        default: 'amd64'
+      python-main-app-image:
+        required: true
+        type: string
+      python-remote-app-image:
+        required: true
+        type: string
+      traffic-generator-image:
+        required: true
+        type: string
+      demo-repository:
+        description: 'Repository with the enablement scripts (application-signals-demo or a fork)'
+        required: false
+        type: string
+        default: 'wangzlei/application-signals-demo'
+      demo-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+    secrets:
+      INJECTOR_CI_ROLE_ARN:
+        required: true
+    outputs:
+      job-started:
+        value: ${{ jobs.python-eks.outputs.job-started }}
+      validation-result:
+        value: ${{ jobs.python-eks.outputs.validation-result }}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  E2E_TEST_AWS_REGION: ${{ inputs.aws-region }}
+  CLUSTER_NAME: ${{ inputs.test-cluster-name }}
+  CALLER_WORKFLOW_NAME: ${{ inputs.caller-workflow-name }}
+  PYTHON_VERSION: ${{ inputs.python-version }}
+  PYTHON_SDK_IMAGE: ${{ inputs.python-sdk-image }}
+  INJECTION_MODE: ${{ inputs.injection-mode }}
+  NODE_ARCH: ${{ inputs.arch }}
+  MAIN_SAMPLE_APP_IMAGE_ARN: ${{ inputs.python-main-app-image }}
+  REMOTE_SAMPLE_APP_IMAGE_ARN: ${{ inputs.python-remote-app-image }}
+  TRAFFIC_GENERATOR_IMAGE: ${{ inputs.traffic-generator-image }}
+  METRIC_NAMESPACE: ApplicationSignals
+  LOG_GROUP_NAME: /aws/application-signals/data
+  TEST_RESOURCES_FOLDER: ${GITHUB_WORKSPACE}
+  REPOSITORY_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  python-eks:
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    outputs:
+      job-started: ${{ steps.job-started.outputs.job-started }}
+      validation-result: ${{ steps.validation-result.outputs.validation-result }}
+    steps:
+      - name: Check if the job started
+        id: job-started
+        run: echo "job-started=true" >> "$GITHUB_OUTPUT"
+
+      - name: Generate testing id and python sample app namespace
+        run: |
+          # the injection mode is part of the ids so that the old-mode and Injector-mode runs of one workflow run never collide
+          mode_id="$(echo "${INJECTION_MODE}" | tr -c 'a-z0-9' '-' | cut -c1-12 | sed 's/-*$//')"
+          echo TESTING_ID="${{ github.job }}-${mode_id}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
+          echo SAMPLE_APP_NAMESPACE="ns-${{ github.run_id }}-${mode_id}" >> "$GITHUB_ENV"
+          
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      # Pin the JDK used to build the validator. Without it Gradle uses the machine's default JDK, which is
+      # Java 17 on GitHub-hosted runners but Java 25 on CodeBuild's image, which Gradle 8.10 cannot run on.
+      - name: Set up Java for the validator
+        uses: actions/setup-java@dded0888837ed1f317902acf8a20df0ad188d165 # v5.0.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+        # We initialize Gradlew Daemon early on during the workflow because sometimes initialization
+        # fails due to transient issues. If it fails here, then we will try again later before the validators
+      - name: Initiate Gradlew Daemon
+        id: initiate-gradlew
+        uses: ./.github/workflows/actions/execute_and_retry
+        continue-on-error: true
+        with:
+          command: "./gradlew :validator:build"
+          cleanup: "./gradlew clean"
+          max_retry: 3
+          sleep_time: 60
+
+      - name: Download enablement script
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          pre-command: "mkdir enablement-script && cd enablement-script"
+          command: "wget https://raw.githubusercontent.com/${{ inputs.demo-repository }}/${{ inputs.demo-ref }}/scripts/eks/appsignals/enable-app-signals.sh
+          && wget https://raw.githubusercontent.com/${{ inputs.demo-repository }}/${{ inputs.demo-ref }}/scripts/eks/appsignals/clean-app-signals.sh
+          && wget https://raw.githubusercontent.com/${{ inputs.demo-repository }}/${{ inputs.demo-ref }}/scripts/eks/appsignals/install-addon-via-helm.sh"
+          cleanup: "rm -f enable-app-signals.sh clean-app-signals.sh install-addon-via-helm.sh"
+          post-command: "chmod +x enable-app-signals.sh clean-app-signals.sh install-addon-via-helm.sh"
+
+      # We do not want to delete the log group as it contains logs from other sources as well as information that could help us diagnose if the workflow run fails
+      - name: Remove log group deletion command
+        if: always()
+        working-directory: enablement-script
+        run: |
+          delete_log_group="aws logs delete-log-group --log-group-name '${{ env.LOG_GROUP_NAME }}' --region \$REGION"
+          sed -i "s#$delete_log_group##g" clean-app-signals.sh
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
+        with:
+          role-to-assume: ${{ secrets.INJECTOR_CI_ROLE_ARN }}
+          aws-region: ${{ env.E2E_TEST_AWS_REGION }}
+          role-duration-seconds: 3600
+
+      - name: Retrieve account
+        run: echo ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_ENV"
+
+      # local directory to store the kubernetes config
+      - name: Create kubeconfig directory
+        run: mkdir -p ${{ github.workspace }}/.kube
+
+      - name: Set KUBECONFIG environment variable
+        run: echo KUBECONFIG="${{ github.workspace }}/.kube/config" >> "$GITHUB_ENV"
+
+      - name: Set up kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.E2E_TEST_AWS_REGION }}
+
+      - name: Download and install eksctl
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          pre-command: 'mkdir ${{ github.workspace }}/eksctl'
+          command: 'curl -sLO "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz" 
+            && tar -xzf eksctl_Linux_amd64.tar.gz -C ${{ github.workspace }}/eksctl && rm eksctl_Linux_amd64.tar.gz'
+          cleanup: 'rm -f eksctl_Linux_amd64.tar.gz'
+
+      - name: Add eksctl to Github Path
+        run: |
+          echo "${{ github.workspace }}/eksctl" >> "$GITHUB_PATH"
+
+      # This step deletes lingering resources from previous test runs
+      - name: Delete all sample app namespaces
+        continue-on-error: true
+        timeout-minutes: 5
+        run: kubectl get namespace | awk '/^ns-[0-9]+-[0-9]+/{print $1}' | xargs kubectl delete namespace
+
+      - name: Create role for AWS access from the sample app
+        id: create_service_account
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: "eksctl create iamserviceaccount \
+          --name service-account-${{ env.TESTING_ID }} \
+          --namespace ${{ env.SAMPLE_APP_NAMESPACE }} \
+          --cluster ${{ env.CLUSTER_NAME }} \
+          --role-name eks-s3-access-${{ env.TESTING_ID }} \
+          --attach-policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess \
+          --region ${{ env.E2E_TEST_AWS_REGION }} \
+          --approve"
+          cleanup: "eksctl delete iamserviceaccount \
+          --name service-account-${{ env.TESTING_ID }} \
+          --namespace ${{ env.SAMPLE_APP_NAMESPACE }} \
+          --cluster ${{ env.CLUSTER_NAME }} \
+          --region ${{ env.E2E_TEST_AWS_REGION }}"
+          sleep_time: 60
+
+      - name: Set up terraform
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: "wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg"
+          post-command: 'echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(. /etc/os-release && echo "$VERSION_CODENAME") main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+              && sudo apt update && sudo apt install terraform'
+          sleep_time: 60
+
+      - name: Initiate Terraform
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: "cd ${{ env.TEST_RESOURCES_FOLDER }}/terraform/python/eks && terraform init && terraform validate"
+          cleanup: "rm -rf .terraform && rm -rf .terraform.lock.hcl"
+          max_retry: 6
+          sleep_time: 60
+
+      - name: Deploy sample app via terraform and wait for the endpoint to come online
+        id: deploy-python-app
+        working-directory: terraform/python/eks
+        env:
+          # read by enable-app-signals.sh / install-addon-via-helm.sh: install from the chart source, not the EKS add-on
+          HELM_CHART_REPO: ${{ inputs.helm-chart-repo }}
+          HELM_CHART_REF: ${{ inputs.helm-chart-ref }}
+          OPERATOR_IMAGE: ${{ inputs.operator-image }}
+          INSTRUMENTATION_INJECTION_MODE: ${{ inputs.injection-mode }}
+        run: |
+          # Attempt to deploy the sample app on an EKS instance and wait for its endpoint to come online. 
+          # There may be occasional failures due to transitivity issues, so try up to 2 times. 
+          # deployment_failed of 0 indicates that both the terraform deployment and the endpoint are running, while 1 indicates
+          # that it failed at some point
+          retry_counter=0
+          max_retry=2
+          while [ $retry_counter -lt $max_retry ]; do
+            echo "Attempt $retry_counter"
+            deployment_failed=0
+            terraform apply -auto-approve \
+              -var='test_id=${{ env.TESTING_ID }}' \
+              -var='aws_region=${{ env.E2E_TEST_AWS_REGION }}' \
+              -var='kube_directory_path=${{ github.workspace }}/.kube' \
+              -var='eks_cluster_name=${{ env.CLUSTER_NAME }}' \
+              -var="eks_cluster_context_name=$(kubectl config current-context)" \
+              -var='test_namespace=${{ env.SAMPLE_APP_NAMESPACE }}' \
+              -var='service_account_aws_access=service-account-${{ env.TESTING_ID }}' \
+              -var='python_app_image=${{ env.MAIN_SAMPLE_APP_IMAGE_ARN }}' \
+              -var='python_remote_app_image=${{ env.REMOTE_SAMPLE_APP_IMAGE_ARN }}' \
+              -var='account_id=${{ env.ACCOUNT_ID }}' \
+            || deployment_failed=$?
+          
+            if [ $deployment_failed -eq 1 ]; then
+              echo "Terraform deployment was unsuccessful. Will attempt to retry deployment."
+            fi
+
+            # If the deployment_failed is still 0, then the terraform deployment succeeded and now try to connect to the endpoint 
+            # after installing Application Signals. Attempts to connect will be made for up to 10 minutes
+            if [ $deployment_failed -eq 0 ]; then          
+              echo "Installing application signals to the sample app"
+              . ${{ env.TEST_RESOURCES_FOLDER }}/.github/workflows/util/execute_and_retry.sh
+              execute_and_retry 3 \
+              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/enable-app-signals.sh \
+              ${{ inputs.test-cluster-name }} \
+              ${{ env.E2E_TEST_AWS_REGION }} \
+              ${{ env.SAMPLE_APP_NAMESPACE }}" \
+              "${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/clean-app-signals.sh \
+              ${{ inputs.test-cluster-name }} \
+              ${{ env.E2E_TEST_AWS_REGION }} \
+              ${{ env.SAMPLE_APP_NAMESPACE }} && \
+              aws eks update-kubeconfig --name ${{ inputs.test-cluster-name }} --region ${{ env.E2E_TEST_AWS_REGION }}" \
+              60
+          
+              aws eks update-kubeconfig --region ${{ env.E2E_TEST_AWS_REGION }} --name ${{ env.CLUSTER_NAME }}
+                  
+              execute_and_retry 2 "kubectl delete pods --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 60
+              execute_and_retry 2 "kubectl wait --for=condition=Ready --timeout=5m pod --all -n ${{ env.SAMPLE_APP_NAMESPACE }}" "" 10
+            fi
+          
+            # If the deployment_failed is 1 then either the terraform deployment or the endpoint connection failed, so first destroy the
+            # resources created from terraform and try again.
+            if [ $deployment_failed -eq 1 ]; then
+              echo "Cleaning up Application Signal"
+              ${{ env.TEST_RESOURCES_FOLDER }}/enablement-script/clean-app-signals.sh \
+              ${{ env.CLUSTER_NAME }} \
+              ${{ env.E2E_TEST_AWS_REGION }} \
+              ${{ env.SAMPLE_APP_NAMESPACE }}
+
+              # Running clean-app-signal.sh removes the current cluster from the config. Update the cluster again for subsequent runs.
+              aws eks update-kubeconfig --name ${{ inputs.test-cluster-name }} --region ${{ env.E2E_TEST_AWS_REGION }}
+
+              echo "Destroying terraform"
+              terraform destroy -auto-approve \
+                -var='test_id=${{ env.TESTING_ID }}' \
+                -var='aws_region=${{ env.E2E_TEST_AWS_REGION }}' \
+                -var='kube_directory_path=${{ github.workspace }}/.kube' \
+                -var='eks_cluster_name=${{ env.CLUSTER_NAME }}' \
+                -var="eks_cluster_context_name=$(kubectl config current-context)" \
+                -var='test_namespace=${{ env.SAMPLE_APP_NAMESPACE }}' \
+                -var='service_account_aws_access=service-account-${{ env.TESTING_ID }}' \
+                -var='python_app_image=${{ env.MAIN_SAMPLE_APP_IMAGE_ARN }}' \
+                -var='python_remote_app_image=${{ env.REMOTE_SAMPLE_APP_IMAGE_ARN }}'
+          
+              retry_counter=$((retry_counter+1))
+            else
+              # If deployment succeeded, then exit the loop
+              break
+            fi
+          
+            if [ $retry_counter -ge $max_retry ]; then
+              echo "Max retry reached, failed to deploy terraform and connect to the endpoint. Exiting code"
+              exit 1
+            fi
+          done
+
+      # The terraform module has no node selector and hard-codes the traffic generator image in the team account;
+      # pin every sample-app deployment to the requested architecture and use the traffic generator from the inputs.
+      - name: Pin sample apps to the requested architecture
+        run: |
+          kubectl set image -n "${SAMPLE_APP_NAMESPACE}" deployment/traffic-generator "*=${TRAFFIC_GENERATOR_IMAGE}"
+          for d in $(kubectl get deployments -n "${SAMPLE_APP_NAMESPACE}" -o name); do
+            kubectl patch -n "${SAMPLE_APP_NAMESPACE}" "$d" --type merge \
+              -p "{\"spec\":{\"template\":{\"spec\":{\"nodeSelector\":{\"kubernetes.io/arch\":\"${NODE_ARCH}\"}}}}}"
+          done
+          kubectl rollout status -n "${SAMPLE_APP_NAMESPACE}" deployment --timeout=5m
+
+      - name: Patch Image and Check Diff
+        id: patch-image
+        uses: ./.github/workflows/actions/patch_image_and_check_diff
+        with:
+          # selects the action's Python branch: replace --auto-instrumentation-python-image and restart the pods
+          repository: aws-otel-python-instrumentation
+          patch-image-arn: ${{ env.PYTHON_SDK_IMAGE }}
+          sample-app-namespace: ${{ env.SAMPLE_APP_NAMESPACE }}
+
+      - name: Log Artifact Versions
+        run: |
+          echo "ADOT Image: Previous Version is: ${{ steps.patch-image.outputs.default-adot-image }}, Updated Version is: ${{ steps.patch-image.outputs.latest-adot-image }}";
+          echo "CW Agent Image: Previous Version is: ${{ steps.patch-image.outputs.default-cw-agent-image }}, Updated Version is: ${{ steps.patch-image.outputs.latest-cw-agent-image }}";
+          echo "CW Agent Operator Image: Previous Version is: ${{ steps.patch-image.outputs.default-cw-agent-operator-image }}, Updated Version is: ${{ steps.patch-image.outputs.latest-cw-agent-operator-image }}";
+          echo "Fluent Bit Image: Version is: ${{ steps.patch-image.outputs.fluent-bit-image }}";
+
+      - name: Check the injection of the Python app
+        run: |
+          pod="$(kubectl get pods -n "${SAMPLE_APP_NAMESPACE}" --selector=app=python-app -o jsonpath='{.items[0].metadata.name}')"
+          ld_preload="$(kubectl get pod -n "${SAMPLE_APP_NAMESPACE}" "${pod}" -o jsonpath='{.spec.containers[0].env[?(@.name=="LD_PRELOAD")].value}')"
+          node="$(kubectl get pod -n "${SAMPLE_APP_NAMESPACE}" "${pod}" -o jsonpath='{.spec.nodeName}')"
+          echo "pod=${pod} node=${node} arch=$(kubectl get node "${node}" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}') LD_PRELOAD=${ld_preload:-<unset>}"
+          if [ "${INJECTION_MODE}" = "old" ]; then
+            if [ -n "${ld_preload}" ]; then echo "::error::old mode must not set LD_PRELOAD"; exit 1; fi
+          else
+            case "${ld_preload}" in
+              *libotelinject.so*) ;;
+              *) echo "::error::Injector mode ${INJECTION_MODE} must set LD_PRELOAD to libotelinject.so"; exit 1 ;;
+            esac
+          fi
+
+      - name: Get Remote Service Deployment Name
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: echo "REMOTE_SERVICE_DEPLOYMENT_NAME=$(kubectl get deployments -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=remote-app -o jsonpath='{.items[0].metadata.name}')" >> "$GITHUB_ENV"
+          max_retry: 3
+          sleep_time: 30
+
+      - name: Get Remote Service IP
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: echo "REMOTE_SERVICE_POD_IP=$(kubectl get pods -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=remote-app -o jsonpath='{.items[0].status.podIP}')" >> "$GITHUB_ENV"
+          max_retry: 3
+          sleep_time: 30
+
+      - name:  Get the sample app endpoint
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: echo "APP_ENDPOINT=$(kubectl get pods -n ${{ env.SAMPLE_APP_NAMESPACE }} --selector=app=python-app -o jsonpath='{.items[0].status.podIP}'):8000" >> "$GITHUB_ENV"
+          max_retry: 3
+          sleep_time: 30
+
+      - name: Set endpoints for the traffic generator
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          command: kubectl set env -n ${{ env.SAMPLE_APP_NAMESPACE }} deployment/traffic-generator MAIN_ENDPOINT=${{ env.APP_ENDPOINT }} REMOTE_ENDPOINT=${{ env.REMOTE_SERVICE_POD_IP }}
+          max_retry: 3
+          sleep_time: 30
+
+      - name: Initiate Gradlew Daemon
+        if: steps.initiate-gradlew.outcome == 'failure'
+        uses: ./.github/workflows/actions/execute_and_retry
+        continue-on-error: true
+        with:
+          command: "./gradlew :validator:build"
+          cleanup: "./gradlew clean"
+          max_retry: 3
+          sleep_time: 60
+
+      # Validation for application signals telemetry data
+      - name: Call endpoint and validate generated EMF logs
+        id: log-validation
+        if: steps.deploy-python-app.outcome == 'success' && !cancelled()
+        run: ./gradlew validator:run --args='-c python/eks/log-validation.yml
+          --testing-id ${{ env.TESTING_ID }}
+          --endpoint http://${{ env.APP_ENDPOINT }}
+          --region ${{ env.E2E_TEST_AWS_REGION }}
+          --account-id ${{ env.ACCOUNT_ID }}
+          --metric-namespace ${{ env.METRIC_NAMESPACE }}
+          --log-group ${{ env.LOG_GROUP_NAME }}
+          --app-namespace ${{ env.SAMPLE_APP_NAMESPACE }}
+          --platform-info ${{ env.CLUSTER_NAME }}
+          --service-name python-application-${{ env.TESTING_ID }}
+          --remote-service-deployment-name ${{ env.REMOTE_SERVICE_DEPLOYMENT_NAME }}
+          --remote-resource-identifier "information_schema|mysql-service.${{ env.SAMPLE_APP_NAMESPACE }}.svc.cluster.local|3306"
+          --remote-db-user root
+          --query-string ip=${{ env.REMOTE_SERVICE_POD_IP }}&testingId=${{ env.TESTING_ID }}
+          --rollup'
+
+      - name: Call endpoints and validate generated metrics
+        id: metric-validation
+        if: (steps.deploy-python-app.outcome == 'success' || steps.log-validation.outcome == 'failure') && !cancelled()
+        run: ./gradlew validator:run --args='-c python/eks/metric-validation.yml
+          --testing-id ${{ env.TESTING_ID }}
+          --endpoint http://${{ env.APP_ENDPOINT }}
+          --region ${{ env.E2E_TEST_AWS_REGION }}
+          --account-id ${{ env.ACCOUNT_ID }}
+          --metric-namespace ${{ env.METRIC_NAMESPACE }}
+          --log-group ${{ env.LOG_GROUP_NAME }}
+          --app-namespace ${{ env.SAMPLE_APP_NAMESPACE }}
+          --platform-info ${{ env.CLUSTER_NAME }}
+          --service-name python-application-${{ env.TESTING_ID }}
+          --remote-service-name python-remote-application-${{ env.TESTING_ID }}
+          --remote-service-deployment-name ${{ env.REMOTE_SERVICE_DEPLOYMENT_NAME }}
+          --remote-resource-identifier "information_schema|mysql-service.${{ env.SAMPLE_APP_NAMESPACE }}.svc.cluster.local|3306"
+          --query-string ip=${{ env.REMOTE_SERVICE_POD_IP }}&testingId=${{ env.TESTING_ID }}
+          --rollup'
+
+      - name: Call endpoints and validate generated traces
+        id: trace-validation
+        if: (steps.deploy-python-app.outcome == 'success' || steps.log-validation.outcome == 'failure' || steps.metric-validation.outcome == 'failure') && !cancelled()
+        run: ./gradlew validator:run --args='-c python/eks/trace-validation.yml
+          --testing-id ${{ env.TESTING_ID }}
+          --endpoint http://${{ env.APP_ENDPOINT }}
+          --region ${{ env.E2E_TEST_AWS_REGION }}
+          --account-id ${{ env.ACCOUNT_ID }}
+          --log-group ${{ env.LOG_GROUP_NAME }}
+          --app-namespace ${{ env.SAMPLE_APP_NAMESPACE }}
+          --platform-info ${{ env.CLUSTER_NAME }}
+          --service-name python-application-${{ env.TESTING_ID }}
+          --remote-service-deployment-name ${{ env.REMOTE_SERVICE_DEPLOYMENT_NAME }}
+          --remote-resource-identifier "information_schema|mysql-service.${{ env.SAMPLE_APP_NAMESPACE }}.svc.cluster.local|3306"
+          --query-string ip=${{ env.REMOTE_SERVICE_POD_IP }}&testingId=${{ env.TESTING_ID }}
+          --rollup'
+
+      - name: Save test results
+        if: always()
+        id: validation-result
+        run: |
+          if [ "${{ steps.log-validation.outcome }}" = "success" ] && [ "${{ steps.metric-validation.outcome }}" = "success" ] && [ "${{ steps.trace-validation.outcome }}" = "success" ]; then
+            echo "validation-result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "validation-result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Clean up Procedures
+
+      - name: Clean Up Application Signals
+        if: always()
+        continue-on-error: true
+        working-directory: enablement-script
+        run: |
+          ./clean-app-signals.sh \
+          ${{ inputs.test-cluster-name }} \
+          ${{ env.E2E_TEST_AWS_REGION }} \
+          ${{ env.SAMPLE_APP_NAMESPACE }}
+
+      # This step also deletes lingering resources from previous test runs
+      - name: Delete all sample app resources
+        if: always()
+        continue-on-error: true
+        run: kubectl delete namespace ${{ env.SAMPLE_APP_NAMESPACE }}
+
+      - name: Terraform destroy
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        working-directory: terraform/python/eks
+        run: |
+          terraform destroy -auto-approve \
+            -var='test_id=${{ env.TESTING_ID }}' \
+            -var='aws_region=${{ env.E2E_TEST_AWS_REGION }}' \
+            -var='kube_directory_path=${{ github.workspace }}/.kube' \
+            -var='eks_cluster_name=${{ env.CLUSTER_NAME }}' \
+            -var='test_namespace=${{ env.SAMPLE_APP_NAMESPACE }}' \
+            -var='service_account_aws_access=service-account-${{ env.TESTING_ID }}' \
+            -var='python_app_image=${{ env.MAIN_SAMPLE_APP_IMAGE_ARN }}' \
+            -var='python_remote_app_image=${{ env.REMOTE_SAMPLE_APP_IMAGE_ARN }}'
+
+      - name: Remove aws access service account
+        if: always()
+        continue-on-error: true
+        run: |
+          eksctl delete iamserviceaccount \
+          --name service-account-${{ env.TESTING_ID }} \
+          --namespace ${{ env.SAMPLE_APP_NAMESPACE }} \
+          --cluster ${{ env.CLUSTER_NAME }} \
+          --region ${{ env.E2E_TEST_AWS_REGION }}

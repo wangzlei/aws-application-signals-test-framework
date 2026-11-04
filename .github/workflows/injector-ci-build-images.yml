@@ -1,0 +1,196 @@
+## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+## SPDX-License-Identifier: Apache-2.0
+
+# Builds the images the Injector-mode E2E tests need and pushes them, multi-arch (amd64 + arm64), to one
+# ECR repository:
+#   - the CloudWatch Agent operator with the Injector injection mode (from a fork branch),
+#   - the ADOT Python auto-instrumentation image with the start-up guard (from a fork branch),
+#   - the Python sample apps and the traffic generator used by python-eks-injector-test.yml,
+#   - the start-up guard test apps used by injector-guard-cases.yml.
+# Image tags are "<kind>-<tag>", e.g. "<repo>:operator-<tag>".
+name: Injector CI - Build Images
+on:
+  workflow_dispatch:
+    inputs:
+      ecr-repository:
+        description: 'ECR repository URI to push to, e.g. 123456789012.dkr.ecr.us-west-2.amazonaws.com/guard-test'
+        required: true
+        type: string
+      tag:
+        description: 'Tag suffix for all images (default: the run id)'
+        required: false
+        type: string
+      operator-repository:
+        required: false
+        type: string
+        default: 'wangzlei/amazon-cloudwatch-agent-operator'
+      operator-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+      python-sdk-repository:
+        required: false
+        type: string
+        default: 'wangzlei/aws-otel-python-instrumentation'
+      python-sdk-ref:
+        required: false
+        type: string
+        default: 'startup-guard'
+      injector-release-base-url:
+        description: 'Base URL of the aws-otel-injector-v* GitHub releases the Python image downloads from'
+        required: false
+        type: string
+        default: 'https://github.com/wangzlei/aws-otel-python-instrumentation/releases/download'
+  workflow_call:
+    inputs:
+      ecr-repository:
+        required: true
+        type: string
+      tag:
+        required: false
+        type: string
+      operator-repository:
+        required: false
+        type: string
+        default: 'wangzlei/amazon-cloudwatch-agent-operator'
+      operator-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+      python-sdk-repository:
+        required: false
+        type: string
+        default: 'wangzlei/aws-otel-python-instrumentation'
+      python-sdk-ref:
+        required: false
+        type: string
+        default: 'startup-guard'
+      injector-release-base-url:
+        required: false
+        type: string
+        default: 'https://github.com/wangzlei/aws-otel-python-instrumentation/releases/download'
+    outputs:
+      operator-image:
+        value: ${{ jobs.build.outputs.operator-image }}
+      python-sdk-image:
+        value: ${{ jobs.build.outputs.python-sdk-image }}
+      python-main-app-image:
+        value: ${{ jobs.build.outputs.python-main-app-image }}
+      python-remote-app-image:
+        value: ${{ jobs.build.outputs.python-remote-app-image }}
+      traffic-generator-image:
+        value: ${{ jobs.build.outputs.traffic-generator-image }}
+      guard-umg-app-image:
+        value: ${{ jobs.build.outputs.guard-umg-app-image }}
+      guard-healthy-app-image:
+        value: ${{ jobs.build.outputs.guard-healthy-app-image }}
+    secrets:
+      INJECTOR_CI_ROLE_ARN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REPO: ${{ inputs.ecr-repository }}
+      TAG: ${{ inputs.tag || github.run_id }}
+    outputs:
+      operator-image: ${{ steps.names.outputs.operator }}
+      python-sdk-image: ${{ steps.names.outputs.python_sdk }}
+      python-main-app-image: ${{ steps.names.outputs.python_main }}
+      python-remote-app-image: ${{ steps.names.outputs.python_remote }}
+      traffic-generator-image: ${{ steps.names.outputs.traffic_generator }}
+      guard-umg-app-image: ${{ steps.names.outputs.guard_umg }}
+      guard-healthy-app-image: ${{ steps.names.outputs.guard_healthy }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Image names
+        id: names
+        run: |
+          {
+            echo "operator=${REPO}:operator-${TAG}"
+            echo "python_sdk=${REPO}:python-sdk-${TAG}"
+            echo "python_main=${REPO}:python-main-${TAG}"
+            echo "python_remote=${REPO}:python-remote-${TAG}"
+            echo "traffic_generator=${REPO}:traffic-generator-${TAG}"
+            echo "guard_umg=${REPO}:guard-umg-${TAG}"
+            echo "guard_healthy=${REPO}:guard-healthy-${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      # The registry and region are part of the repository URI: <account>.dkr.ecr.<region>.amazonaws.com/<name>
+      - name: Derive registry and region
+        run: |
+          registry="${REPO%%/*}"
+          echo "ECR_REGISTRY=${registry}" >> "$GITHUB_ENV"
+          echo "ECR_REGION=$(echo "${registry}" | cut -d. -f4)" >> "$GITHUB_ENV"
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
+        with:
+          role-to-assume: ${{ secrets.INJECTOR_CI_ROLE_ARN }}
+          aws-region: ${{ env.ECR_REGION }}
+
+      - name: Log in to ECR
+        run: aws ecr get-login-password --region "${ECR_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Check out the operator
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ inputs.operator-repository }}
+          ref: ${{ inputs.operator-ref }}
+          path: src/operator
+
+      - name: Build and push the operator image
+        run: |
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg VERSION="injector-ci-${TAG}" \
+            -t "${{ steps.names.outputs.operator }}" src/operator
+
+      - name: Check out the Python SDK
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ inputs.python-sdk-repository }}
+          ref: ${{ inputs.python-sdk-ref }}
+          path: src/python-sdk
+
+      - name: Build and push the Python SDK image
+        env:
+          INJECTOR_RELEASE_BASE_URL: ${{ inputs.injector-release-base-url }}
+        run: |
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg OTEL_INJECTOR_RELEASE_BASE_URL="${INJECTOR_RELEASE_BASE_URL}" \
+            -t "${{ steps.names.outputs.python_sdk }}" src/python-sdk
+
+      - name: Build and push the Python sample apps
+        working-directory: sample-apps/python
+        run: |
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            -f django_frontend_service/Dockerfile -t "${{ steps.names.outputs.python_main }}" .
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            -f django_remote_service/Dockerfile -t "${{ steps.names.outputs.python_remote }}" .
+
+      - name: Build and push the traffic generator
+        working-directory: sample-apps/traffic-generator
+        run: |
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            -t "${{ steps.names.outputs.traffic_generator }}" .
+
+      - name: Build and push the start-up guard test apps
+        working-directory: sample-apps/python/injector-guard
+        run: |
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg PYTHON_VERSION=3.9 -t "${{ steps.names.outputs.guard_umg }}" .
+          docker buildx build --push --platform linux/amd64,linux/arm64 \
+            --build-arg PYTHON_VERSION=3.11 -t "${{ steps.names.outputs.guard_healthy }}" .

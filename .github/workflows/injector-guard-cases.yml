@@ -1,0 +1,245 @@
+## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+## SPDX-License-Identifier: Apache-2.0
+
+# Reusable workflow: start-up guard cases for the Injector injection mode on EKS.
+#   - UMG case: a Python 3.9 app whose urllib3 1.26.20 is shadowed by the urllib3 bundled with the SDK crashes at
+#     start-up; with the guard the pod must become Ready after at most 3 restarts, log "ADOT SDK skipped for python"
+#     and serve with its own urllib3.
+#   - healthy case: a Python 3.11 app must start with the SDK and 0 restarts.
+# The add-on is installed from a helm-charts git repository/ref with the given operator image, the Python SDK
+# image under test is patched in, and the add-on is removed again at the end.
+# It is meant to be called from injector-e2e.yml.
+name: Injector Start-up Guard Cases
+on:
+  workflow_call:
+    inputs:
+      aws-region:
+        required: true
+        type: string
+      test-cluster-name:
+        required: true
+        type: string
+      helm-chart-repo:
+        required: false
+        type: string
+        default: 'https://github.com/wangzlei/helm-charts.git'
+      helm-chart-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+      operator-image:
+        required: true
+        type: string
+      python-sdk-image:
+        required: true
+        type: string
+      injection-mode:
+        description: 'Injector mode to test the guard with (must include python): injector | python | ...'
+        required: false
+        type: string
+        default: 'python'
+      arch:
+        required: false
+        type: string
+        default: 'amd64'
+      guard-umg-app-image:
+        required: true
+        type: string
+      guard-healthy-app-image:
+        required: true
+        type: string
+      demo-repository:
+        required: false
+        type: string
+        default: 'wangzlei/application-signals-demo'
+      demo-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+    outputs:
+      validation-result:
+        value: ${{ jobs.guard-cases.outputs.validation-result }}
+    secrets:
+      INJECTOR_CI_ROLE_ARN:
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ inputs.aws-region }}
+  CLUSTER_NAME: ${{ inputs.test-cluster-name }}
+  NODE_ARCH: ${{ inputs.arch }}
+  UMG_IMAGE: ${{ inputs.guard-umg-app-image }}
+  HEALTHY_IMAGE: ${{ inputs.guard-healthy-app-image }}
+
+jobs:
+  guard-cases:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      validation-result: ${{ steps.result.outputs.validation-result }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+
+      - name: Namespace
+        run: echo NAMESPACE="guard-${{ github.run_id }}-${{ github.run_attempt }}-${NODE_ARCH}" >> "$GITHUB_ENV"
+
+      - name: Download enablement scripts
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          pre-command: "mkdir enablement-script && cd enablement-script"
+          command: "wget https://raw.githubusercontent.com/${{ inputs.demo-repository }}/${{ inputs.demo-ref }}/scripts/eks/appsignals/enable-app-signals.sh
+          && wget https://raw.githubusercontent.com/${{ inputs.demo-repository }}/${{ inputs.demo-ref }}/scripts/eks/appsignals/clean-app-signals.sh
+          && wget https://raw.githubusercontent.com/${{ inputs.demo-repository }}/${{ inputs.demo-ref }}/scripts/eks/appsignals/install-addon-via-helm.sh"
+          cleanup: "rm -f enable-app-signals.sh clean-app-signals.sh install-addon-via-helm.sh"
+          post-command: "chmod +x enable-app-signals.sh clean-app-signals.sh install-addon-via-helm.sh"
+
+      # Keep the shared Application Signals log group, like python-eks-test.yml does
+      - name: Remove log group deletion command
+        working-directory: enablement-script
+        run: |
+          delete_log_group="aws logs delete-log-group --log-group-name '/aws/application-signals/data' --region \$REGION"
+          sed -i "s#$delete_log_group##g" clean-app-signals.sh
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@a03048d87541d1d9fcf2ecf528a4a65ba9bd7838 # v5.0.0
+        with:
+          role-to-assume: ${{ secrets.INJECTOR_CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p "${{ github.workspace }}/.kube"
+          echo KUBECONFIG="${{ github.workspace }}/.kube/config" >> "$GITHUB_ENV"
+          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}" --kubeconfig "${{ github.workspace }}/.kube/config"
+
+      - name: Download and install eksctl
+        uses: ./.github/workflows/actions/execute_and_retry
+        with:
+          pre-command: 'mkdir ${{ github.workspace }}/eksctl'
+          command: 'curl -sLO "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_Linux_amd64.tar.gz"
+            && tar -xzf eksctl_Linux_amd64.tar.gz -C ${{ github.workspace }}/eksctl && rm eksctl_Linux_amd64.tar.gz'
+          cleanup: 'rm -f eksctl_Linux_amd64.tar.gz'
+
+      - name: Add eksctl to Github Path
+        run: echo "${{ github.workspace }}/eksctl" >> "$GITHUB_PATH"
+
+      - name: Create the namespace
+        run: kubectl create namespace "${NAMESPACE}"
+
+      - name: Install the add-on from the chart source
+        env:
+          HELM_CHART_REPO: ${{ inputs.helm-chart-repo }}
+          HELM_CHART_REF: ${{ inputs.helm-chart-ref }}
+          OPERATOR_IMAGE: ${{ inputs.operator-image }}
+          INSTRUMENTATION_INJECTION_MODE: ${{ inputs.injection-mode }}
+        run: |
+          . .github/workflows/util/execute_and_retry.sh
+          execute_and_retry 3 \
+            "enablement-script/enable-app-signals.sh ${CLUSTER_NAME} ${AWS_REGION} ${NAMESPACE}" \
+            "enablement-script/clean-app-signals.sh ${CLUSTER_NAME} ${AWS_REGION} ${NAMESPACE} && aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}" \
+            60
+          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+
+      - name: Use the Python SDK image under test
+        env:
+          PYTHON_SDK_IMAGE: ${{ inputs.python-sdk-image }}
+        run: |
+          kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager -o json | \
+            jq --arg img "${PYTHON_SDK_IMAGE}" '.spec.template.spec.containers[0].args |= map(if test("^--auto-instrumentation-python-image=") then "--auto-instrumentation-python-image=" + $img else . end)' | \
+            kubectl apply -f -
+          kubectl rollout status deployment/amazon-cloudwatch-observability-controller-manager -n amazon-cloudwatch --timeout=180s
+          kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
+            -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep -E 'injection-mode|python-image'
+
+      - name: Deploy the guard test apps
+        run: |
+          for app in umg healthy; do
+            if [ "$app" = umg ]; then image="${UMG_IMAGE}"; else image="${HEALTHY_IMAGE}"; fi
+            cat <<YAML | kubectl apply -n "${NAMESPACE}" -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: guard-${app}
+            annotations:
+              instrumentation.opentelemetry.io/inject-python: "true"
+          spec:
+            replicas: 1
+            selector:
+              matchLabels: {app: guard-${app}}
+            template:
+              metadata:
+                labels: {app: guard-${app}}
+                annotations:
+                  instrumentation.opentelemetry.io/inject-python: "true"
+              spec:
+                nodeSelector: {kubernetes.io/arch: ${NODE_ARCH}}
+                terminationGracePeriodSeconds: 1
+                containers:
+                - name: app
+                  image: ${image}
+                  ports: [{containerPort: 8080}]
+                  readinessProbe: {httpGet: {path: /, port: 8080}, periodSeconds: 2}
+          YAML
+          done
+
+      - name: Check the healthy app
+        run: |
+          kubectl rollout status -n "${NAMESPACE}" deployment/guard-healthy --timeout=5m
+          pod="$(kubectl get pods -n "${NAMESPACE}" -l app=guard-healthy -o jsonpath='{.items[0].metadata.name}')"
+          restarts="$(kubectl get pod -n "${NAMESPACE}" "${pod}" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+          ld_preload="$(kubectl get pod -n "${NAMESPACE}" "${pod}" -o jsonpath='{.spec.containers[0].env[?(@.name=="LD_PRELOAD")].value}')"
+          echo "healthy: pod=${pod} restarts=${restarts} LD_PRELOAD=${ld_preload:-<unset>}"
+          kubectl logs -n "${NAMESPACE}" "${pod}" -c app | tail -5
+          [ "${restarts}" = 0 ] || { echo "::error::healthy app restarted ${restarts} times"; exit 1; }
+          case "${ld_preload}" in *libotelinject.so*) ;; *) echo "::error::healthy app was not injected through the Injector"; exit 1 ;; esac
+          if kubectl logs -n "${NAMESPACE}" "${pod}" -c app | grep -q "ADOT SDK skipped"; then
+            echo "::error::the guard skipped the SDK for a healthy app"; exit 1
+          fi
+
+      - name: Check that the UMG app recovers
+        run: |
+          kubectl rollout status -n "${NAMESPACE}" deployment/guard-umg --timeout=8m
+          pod="$(kubectl get pods -n "${NAMESPACE}" -l app=guard-umg -o jsonpath='{.items[0].metadata.name}')"
+          restarts="$(kubectl get pod -n "${NAMESPACE}" "${pod}" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+          echo "umg: pod=${pod} restarts=${restarts}"
+          kubectl logs -n "${NAMESPACE}" "${pod}" -c app > umg.log
+          tail -5 umg.log
+          [ "${restarts}" -ge 1 ] || { echo "::error::the UMG app did not crash with the SDK; the case does not reproduce"; exit 1; }
+          [ "${restarts}" -le 3 ] || { echo "::error::the UMG app needed ${restarts} restarts (> 3)"; exit 1; }
+          grep -q "ADOT SDK skipped for python" umg.log || { echo "::error::no 'ADOT SDK skipped for python' log line"; exit 1; }
+          grep -q "serving, urllib3 1.26.20" umg.log || { echo "::error::the app does not serve with its own urllib3 1.26.20"; exit 1; }
+
+      - name: Save test result
+        if: always()
+        id: result
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "validation-result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "validation-result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect diagnostics
+        if: failure()
+        continue-on-error: true
+        run: |
+          kubectl get pods -n "${NAMESPACE}" -o wide
+          for p in $(kubectl get pods -n "${NAMESPACE}" -o name); do
+            echo "== $p"; kubectl logs -n "${NAMESPACE}" "$p" -c app --previous 2>/dev/null | tail -20
+            kubectl logs -n "${NAMESPACE}" "$p" -c app 2>/dev/null | tail -20
+          done
+
+      - name: Clean up the add-on
+        if: always()
+        continue-on-error: true
+        run: |
+          enablement-script/clean-app-signals.sh "${CLUSTER_NAME}" "${AWS_REGION}" "${NAMESPACE}"
+          aws eks update-kubeconfig --name "${CLUSTER_NAME}" --region "${AWS_REGION}"
+
+      - name: Delete the namespace
+        if: always()
+        continue-on-error: true
+        run: kubectl delete namespace "${NAMESPACE}" --wait=false

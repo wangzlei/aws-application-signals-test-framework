@@ -1,0 +1,178 @@
+## Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+## SPDX-License-Identifier: Apache-2.0
+
+# End-to-end test of the Injector injection mode with the UNRELEASED add-on (helm chart and operator from
+# fork branches) and the Python SDK under test:
+#   1. build and push all images (skipped when image-tag is given, to reuse a previous build),
+#   2. the normal Python EKS validation (logs, metrics, traces) with injection mode "old",
+#   3. the same validation with the Injector mode (both must pass: telemetry is unchanged),
+#   4. the start-up guard cases (UMG app recovers, healthy app keeps the SDK).
+# Runs are serialized per cluster because the add-on is installed cluster-wide.
+name: Injector E2E
+on:
+  workflow_dispatch:
+    inputs:
+      aws-region:
+        required: false
+        type: string
+        default: 'us-east-2'
+      test-cluster-name:
+        required: false
+        type: string
+        default: 'guard-test'
+      ecr-repository:
+        description: 'ECR repository URI for the test images, e.g. 123456789012.dkr.ecr.us-west-2.amazonaws.com/guard-test'
+        required: true
+        type: string
+      image-tag:
+        description: 'Reuse images built by a previous run (their tag suffix); empty = build now'
+        required: false
+        type: string
+      arch:
+        description: 'Node architecture to run the apps on'
+        required: false
+        type: choice
+        options: [amd64, arm64]
+        default: amd64
+      injection-mode:
+        description: 'Injector mode to compare with "old" (must include python)'
+        required: false
+        type: string
+        default: 'python'
+      helm-chart-repo:
+        required: false
+        type: string
+        default: 'https://github.com/wangzlei/helm-charts.git'
+      helm-chart-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+      operator-ref:
+        required: false
+        type: string
+        default: 'injector-mode'
+      python-sdk-ref:
+        required: false
+        type: string
+        default: 'startup-guard'
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: injector-e2e-${{ inputs.test-cluster-name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ inputs.image-tag == '' }}
+    uses: ./.github/workflows/injector-ci-build-images.yml
+    secrets: inherit
+    with:
+      ecr-repository: ${{ inputs.ecr-repository }}
+      tag: ${{ github.run_id }}
+      operator-ref: ${{ inputs.operator-ref }}
+      python-sdk-ref: ${{ inputs.python-sdk-ref }}
+
+  images:
+    needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    outputs:
+      operator: ${{ steps.names.outputs.operator }}
+      python_sdk: ${{ steps.names.outputs.python_sdk }}
+      python_main: ${{ steps.names.outputs.python_main }}
+      python_remote: ${{ steps.names.outputs.python_remote }}
+      traffic_generator: ${{ steps.names.outputs.traffic_generator }}
+      guard_umg: ${{ steps.names.outputs.guard_umg }}
+      guard_healthy: ${{ steps.names.outputs.guard_healthy }}
+    steps:
+      - name: Image names
+        id: names
+        env:
+          REPO: ${{ inputs.ecr-repository }}
+          TAG: ${{ inputs.image-tag || github.run_id }}
+        run: |
+          {
+            echo "operator=${REPO}:operator-${TAG}"
+            echo "python_sdk=${REPO}:python-sdk-${TAG}"
+            echo "python_main=${REPO}:python-main-${TAG}"
+            echo "python_remote=${REPO}:python-remote-${TAG}"
+            echo "traffic_generator=${REPO}:traffic-generator-${TAG}"
+            echo "guard_umg=${REPO}:guard-umg-${TAG}"
+            echo "guard_healthy=${REPO}:guard-healthy-${TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+  validate-old-mode:
+    needs: images
+    if: ${{ !cancelled() && needs.images.result == 'success' }}
+    uses: ./.github/workflows/python-eks-injector-test.yml
+    secrets: inherit
+    with:
+      aws-region: ${{ inputs.aws-region }}
+      test-cluster-name: ${{ inputs.test-cluster-name }}
+      helm-chart-repo: ${{ inputs.helm-chart-repo }}
+      helm-chart-ref: ${{ inputs.helm-chart-ref }}
+      operator-image: ${{ needs.images.outputs.operator }}
+      python-sdk-image: ${{ needs.images.outputs.python_sdk }}
+      injection-mode: old
+      arch: ${{ inputs.arch }}
+      python-main-app-image: ${{ needs.images.outputs.python_main }}
+      python-remote-app-image: ${{ needs.images.outputs.python_remote }}
+      traffic-generator-image: ${{ needs.images.outputs.traffic_generator }}
+
+  validate-injector-mode:
+    needs: [images, validate-old-mode]
+    if: ${{ !cancelled() && needs.images.result == 'success' }}
+    uses: ./.github/workflows/python-eks-injector-test.yml
+    secrets: inherit
+    with:
+      aws-region: ${{ inputs.aws-region }}
+      test-cluster-name: ${{ inputs.test-cluster-name }}
+      helm-chart-repo: ${{ inputs.helm-chart-repo }}
+      helm-chart-ref: ${{ inputs.helm-chart-ref }}
+      operator-image: ${{ needs.images.outputs.operator }}
+      python-sdk-image: ${{ needs.images.outputs.python_sdk }}
+      injection-mode: ${{ inputs.injection-mode }}
+      arch: ${{ inputs.arch }}
+      python-main-app-image: ${{ needs.images.outputs.python_main }}
+      python-remote-app-image: ${{ needs.images.outputs.python_remote }}
+      traffic-generator-image: ${{ needs.images.outputs.traffic_generator }}
+
+  guard-cases:
+    needs: [images, validate-injector-mode]
+    if: ${{ !cancelled() && needs.images.result == 'success' }}
+    uses: ./.github/workflows/injector-guard-cases.yml
+    secrets: inherit
+    with:
+      aws-region: ${{ inputs.aws-region }}
+      test-cluster-name: ${{ inputs.test-cluster-name }}
+      helm-chart-repo: ${{ inputs.helm-chart-repo }}
+      helm-chart-ref: ${{ inputs.helm-chart-ref }}
+      operator-image: ${{ needs.images.outputs.operator }}
+      python-sdk-image: ${{ needs.images.outputs.python_sdk }}
+      injection-mode: ${{ inputs.injection-mode }}
+      arch: ${{ inputs.arch }}
+      guard-umg-app-image: ${{ needs.images.outputs.guard_umg }}
+      guard-healthy-app-image: ${{ needs.images.outputs.guard_healthy }}
+
+  summary:
+    needs: [validate-old-mode, validate-injector-mode, guard-cases]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Results
+        env:
+          OLD: ${{ needs.validate-old-mode.outputs.validation-result }}
+          NEW: ${{ needs.validate-injector-mode.outputs.validation-result }}
+          GUARD: ${{ needs.guard-cases.outputs.validation-result }}
+        run: |
+          {
+            echo "| Check | Result |"
+            echo "|---|---|"
+            echo "| Python validation, injection mode old | ${OLD:-not run} |"
+            echo "| Python validation, injection mode ${{ inputs.injection-mode }} | ${NEW:-not run} |"
+            echo "| Start-up guard cases | ${GUARD:-not run} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${OLD}" = success ] && [ "${NEW}" = success ] && [ "${GUARD}" = success ]
