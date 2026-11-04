@@ -29,6 +29,12 @@
       "Resource": "arn:aws:eks:us-east-2:292779133546:cluster/guard-test"
     },
     {
+      "Sid": "EksDescribeClusterVersions",
+      "Effect": "Allow",
+      "Action": "eks:DescribeClusterVersions",
+      "Resource": "*"
+    },
+    {
       "Sid": "EksctlIamServiceAccountStacks",
       "Effect": "Allow",
       "Action": [

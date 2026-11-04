@@ -101,6 +101,10 @@ Resources:
             Action: eks:DescribeCluster
             Resource:
               Fn::Sub: arn:aws:eks:${ClusterRegion}:${AWS::AccountId}:cluster/${ClusterName}
+          - Sid: EksDescribeClusterVersions
+            Effect: Allow
+            Action: eks:DescribeClusterVersions
+            Resource: '*'
           - Sid: EksctlIamServiceAccountStacks
             Effect: Allow
             Action:
