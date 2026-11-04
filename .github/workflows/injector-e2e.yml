@@ -5,8 +5,10 @@
 # fork branches) and the Python SDK under test:
 #   1. build and push all images (skipped when image-tag is given, to reuse a previous build),
 #   2. the normal Python EKS validation (logs, metrics, traces) with injection mode "old",
-#   3. the same validation with the Injector mode (both must pass: telemetry is unchanged),
-#   4. the start-up guard cases (UMG app recovers, healthy app keeps the SDK).
+#   3. the same validation with the Injector mode switched on the customer way,
+#      manager.applicationSignals.autoMonitor.instrumentationGuard=true (both must pass: telemetry is unchanged),
+#   4. the start-up guard cases (UMG app recovers, healthy app keeps the SDK), with the Injector switched on through
+#      the internal manager.instrumentationInjectionMode (injection-mode), so that path stays tested too.
 # Runs are serialized per cluster because the add-on is installed cluster-wide.
 name: Injector E2E
 on:
@@ -35,7 +37,7 @@ on:
         options: [amd64, arm64]
         default: amd64
       injection-mode:
-        description: 'Injector mode to compare with "old" (must include python)'
+        description: 'Internal injector mode (manager.instrumentationInjectionMode) for the guard cases (must include python); the Python validation uses instrumentationGuard=true'
         required: false
         type: string
         default: 'python'
@@ -134,7 +136,8 @@ jobs:
       helm-chart-ref: ${{ inputs.helm-chart-ref }}
       operator-image: ${{ needs.images.outputs.operator }}
       python-sdk-image: ${{ needs.images.outputs.python_sdk }}
-      injection-mode: ${{ inputs.injection-mode }}
+      injection-mode: old
+      instrumentation-guard: ${{ 'true' }}
       arch: ${{ inputs.arch }}
       python-main-app-image: ${{ needs.images.outputs.python_main }}
       python-remote-app-image: ${{ needs.images.outputs.python_remote }}
@@ -172,7 +175,7 @@ jobs:
             echo "| Check | Result |"
             echo "|---|---|"
             echo "| Python validation, injection mode old | ${OLD:-not run} |"
-            echo "| Python validation, injection mode ${{ inputs.injection-mode }} | ${NEW:-not run} |"
-            echo "| Start-up guard cases | ${GUARD:-not run} |"
+            echo "| Python validation, instrumentationGuard true | ${NEW:-not run} |"
+            echo "| Start-up guard cases, internal injection mode ${{ inputs.injection-mode }} | ${GUARD:-not run} |"
           } >> "$GITHUB_STEP_SUMMARY"
           [ "${OLD}" = success ] && [ "${NEW}" = success ] && [ "${GUARD}" = success ]

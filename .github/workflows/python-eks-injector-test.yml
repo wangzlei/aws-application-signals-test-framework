@@ -4,7 +4,8 @@
 # Reusable workflow: the Python EKS Application Signals test (python-eks-test.yml) adapted for the
 # Injector injection mode. Differences from python-eks-test.yml:
 #   - the add-on is installed from a helm-charts git repository/ref (e.g. a fork) instead of the EKS add-on,
-#     with a given operator image and manager.instrumentationInjectionMode,
+#     with a given operator image, manager.applicationSignals.autoMonitor.instrumentationGuard (the customer
+#     switch) and/or manager.instrumentationInjectionMode (internal testing knob),
 #   - the Python SDK image under test is patched in as python-eks-test.yml does for the Python repository,
 #   - AWS access uses one role ARN from the INJECTOR_CI_ROLE_ARN secret; sample-app images are inputs,
 #   - all sample-app pods are pinned to the requested CPU architecture,
@@ -52,9 +53,14 @@ on:
         required: true
         type: string
       injection-mode:
-        description: 'manager.instrumentationInjectionMode: old | injector | comma-separated languages'
+        description: 'manager.instrumentationInjectionMode (internal): old | injector | comma-separated languages'
         required: true
         type: string
+      instrumentation-guard:
+        description: 'manager.applicationSignals.autoMonitor.instrumentationGuard: true | false | empty (chart default). true injects all four languages through the Injector and wins over injection-mode'
+        required: false
+        type: string
+        default: ''
       arch:
         description: 'CPU architecture of the nodes to run the sample apps on: amd64 | arm64'
         required: false
@@ -103,6 +109,7 @@ env:
   PYTHON_VERSION: ${{ inputs.python-version }}
   PYTHON_SDK_IMAGE: ${{ inputs.python-sdk-image }}
   INJECTION_MODE: ${{ inputs.injection-mode }}
+  INSTRUMENTATION_GUARD: ${{ inputs.instrumentation-guard }}
   NODE_ARCH: ${{ inputs.arch }}
   MAIN_SAMPLE_APP_IMAGE_ARN: ${{ inputs.python-main-app-image }}
   REMOTE_SAMPLE_APP_IMAGE_ARN: ${{ inputs.python-remote-app-image }}
@@ -127,7 +134,11 @@ jobs:
       - name: Generate testing id and python sample app namespace
         run: |
           # the injection mode is part of the ids so that the old-mode and Injector-mode runs of one workflow run never collide
-          mode_id="$(echo "${INJECTION_MODE}" | tr -c 'a-z0-9' '-' | cut -c1-12 | sed 's/-*$//')"
+          if [ "${INSTRUMENTATION_GUARD}" = "true" ]; then
+            mode_id="guard"
+          else
+            mode_id="$(echo "${INJECTION_MODE}" | tr -c 'a-z0-9' '-' | cut -c1-12 | sed 's/-*$//')"
+          fi
           echo TESTING_ID="${{ github.job }}-${mode_id}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_ENV"
           echo SAMPLE_APP_NAMESPACE="ns-${{ github.run_id }}-${mode_id}" >> "$GITHUB_ENV"
           
@@ -257,6 +268,7 @@ jobs:
           HELM_CHART_REF: ${{ inputs.helm-chart-ref }}
           OPERATOR_IMAGE: ${{ inputs.operator-image }}
           INSTRUMENTATION_INJECTION_MODE: ${{ inputs.injection-mode }}
+          INSTRUMENTATION_GUARD: ${{ inputs.instrumentation-guard }}
         run: |
           # Attempt to deploy the sample app on an EKS instance and wait for its endpoint to come online. 
           # There may be occasional failures due to transitivity issues, so try up to 2 times. 
@@ -377,12 +389,16 @@ jobs:
           ld_preload="$(kubectl get pod -n "${SAMPLE_APP_NAMESPACE}" "${pod}" -o jsonpath='{.spec.containers[0].env[?(@.name=="LD_PRELOAD")].value}')"
           node="$(kubectl get pod -n "${SAMPLE_APP_NAMESPACE}" "${pod}" -o jsonpath='{.spec.nodeName}')"
           echo "pod=${pod} node=${node} arch=$(kubectl get node "${node}" -o jsonpath='{.metadata.labels.kubernetes\.io/arch}') LD_PRELOAD=${ld_preload:-<unset>}"
-          if [ "${INJECTION_MODE}" = "old" ]; then
+          kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
+            -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep -E 'injection-mode|instrumentationGuard' || true
+          # instrumentationGuard true wins over the internal injection mode
+          if [ "${INSTRUMENTATION_GUARD}" = "true" ]; then effective="injector (instrumentationGuard)"; else effective="${INJECTION_MODE}"; fi
+          if [ "${effective}" = "old" ]; then
             if [ -n "${ld_preload}" ]; then echo "::error::old mode must not set LD_PRELOAD"; exit 1; fi
           else
             case "${ld_preload}" in
               *libotelinject.so*) ;;
-              *) echo "::error::Injector mode ${INJECTION_MODE} must set LD_PRELOAD to libotelinject.so"; exit 1 ;;
+              *) echo "::error::Injector mode ${effective} must set LD_PRELOAD to libotelinject.so"; exit 1 ;;
             esac
           fi
 

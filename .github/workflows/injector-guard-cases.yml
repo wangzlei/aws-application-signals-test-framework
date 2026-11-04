@@ -34,10 +34,15 @@ on:
         required: true
         type: string
       injection-mode:
-        description: 'Injector mode to test the guard with (must include python): injector | python | ...'
+        description: 'Internal injector mode to test the guard with (must include python unless instrumentation-guard is true): injector | python | old | ...'
         required: false
         type: string
         default: 'python'
+      instrumentation-guard:
+        description: 'manager.applicationSignals.autoMonitor.instrumentationGuard: true | false | empty (chart default). true injects all four languages through the Injector and wins over injection-mode'
+        required: false
+        type: string
+        default: ''
       arch:
         required: false
         type: string
@@ -135,6 +140,7 @@ jobs:
           HELM_CHART_REF: ${{ inputs.helm-chart-ref }}
           OPERATOR_IMAGE: ${{ inputs.operator-image }}
           INSTRUMENTATION_INJECTION_MODE: ${{ inputs.injection-mode }}
+          INSTRUMENTATION_GUARD: ${{ inputs.instrumentation-guard }}
         run: |
           . .github/workflows/util/execute_and_retry.sh
           execute_and_retry 3 \
@@ -152,7 +158,7 @@ jobs:
             kubectl apply -f -
           kubectl rollout status deployment/amazon-cloudwatch-observability-controller-manager -n amazon-cloudwatch --timeout=180s
           kubectl get deploy -n amazon-cloudwatch amazon-cloudwatch-observability-controller-manager \
-            -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep -E 'injection-mode|python-image'
+            -o jsonpath='{.spec.template.spec.containers[0].args}' | tr ',' '\n' | grep -E 'injection-mode|python-image|instrumentationGuard'
 
       - name: Deploy the guard test apps
         run: |
