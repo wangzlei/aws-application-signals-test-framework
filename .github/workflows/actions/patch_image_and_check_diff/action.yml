@@ -45,11 +45,19 @@ runs:
       id: default-adot-image
       shell: bash
       run: |
+        # With several languages injected, the init container order is not stable: pick this repository's language.
+        case "${{ inputs.repository }}" in
+          aws-otel-python-instrumentation) ADOT_LANG=python ;;
+          aws-otel-java-instrumentation) ADOT_LANG=java ;;
+          aws-otel-dotnet-instrumentation) ADOT_LANG=dotnet ;;
+          aws-otel-js-instrumentation) ADOT_LANG=nodejs ;;
+          *) ADOT_LANG=none ;;
+        esac
         kubectl get pods -n ${{ inputs.sample-app-namespace }} --output json | \
-        jq '.items[0].status.initContainerStatuses[0].imageID'
+        jq --arg lang "$ADOT_LANG" '.items[0].status.initContainerStatuses as $s | (($s | map(select(.name == ("opentelemetry-auto-instrumentation-" + $lang))) | .[0].imageID) // $s[0].imageID)'
         
         echo "DEFAULT_ADOT_IMAGE"=$(kubectl get pods -n ${{ inputs.sample-app-namespace }} --output json | \
-        jq '.items[0].status.initContainerStatuses[0].imageID') >> $GITHUB_OUTPUT
+        jq --arg lang "$ADOT_LANG" '.items[0].status.initContainerStatuses as $s | (($s | map(select(.name == ("opentelemetry-auto-instrumentation-" + $lang))) | .[0].imageID) // $s[0].imageID)') >> $GITHUB_OUTPUT
 
     - name: Save CW Agent image ID to environment before patching
       id: default-cw-agent-image
@@ -191,11 +199,19 @@ runs:
       id: latest-adot-image
       shell: bash
       run: |
+        # With several languages injected, the init container order is not stable: pick this repository's language.
+        case "${{ inputs.repository }}" in
+          aws-otel-python-instrumentation) ADOT_LANG=python ;;
+          aws-otel-java-instrumentation) ADOT_LANG=java ;;
+          aws-otel-dotnet-instrumentation) ADOT_LANG=dotnet ;;
+          aws-otel-js-instrumentation) ADOT_LANG=nodejs ;;
+          *) ADOT_LANG=none ;;
+        esac
         kubectl get pods -n ${{ inputs.sample-app-namespace }} --output json | \
-        jq '.items[0].status.initContainerStatuses[0].imageID'
+        jq --arg lang "$ADOT_LANG" '.items[0].status.initContainerStatuses as $s | (($s | map(select(.name == ("opentelemetry-auto-instrumentation-" + $lang))) | .[0].imageID) // $s[0].imageID)'
         
         echo "LATEST_ADOT_IMAGE"=$(kubectl get pods -n ${{ inputs.sample-app-namespace }} --output json | \
-        jq '.items[0].status.initContainerStatuses[0].imageID') >> $GITHUB_OUTPUT
+        jq --arg lang "$ADOT_LANG" '.items[0].status.initContainerStatuses as $s | (($s | map(select(.name == ("opentelemetry-auto-instrumentation-" + $lang))) | .[0].imageID) // $s[0].imageID)') >> $GITHUB_OUTPUT
 
     - name: Log pod CW Agent image ID and save image to the environment
       id: latest-cw-agent-image
