@@ -266,7 +266,7 @@ resource "kubernetes_deployment_v1" "traffic_generator" {
       spec {
         container {
           name              = "traffic-generator"
-          image             = "${var.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/e2e-test-resource:traffic-generator"
+          image             = var.traffic_generator_image != "" ? var.traffic_generator_image : "${var.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com/e2e-test-resource:traffic-generator"
           image_pull_policy = "Always"
           env {
             name  = "ID"

@@ -66,3 +66,8 @@ variable "python_versions" {
   type    = list(string)
   default = ["3.10"]
 }
+
+variable "traffic_generator_image" {
+  description = "Traffic generator image; empty = the team account default"
+  default     = ""
+}

@@ -272,6 +272,7 @@ jobs:
               -var='service_account_aws_access=service-account-${{ env.TESTING_ID }}' \
               -var='python_app_image=${{ env.MAIN_SAMPLE_APP_IMAGE_ARN }}' \
               -var='python_remote_app_image=${{ env.REMOTE_SAMPLE_APP_IMAGE_ARN }}' \
+              -var='traffic_generator_image=${{ env.TRAFFIC_GENERATOR_IMAGE }}' \
               -var='account_id=${{ env.ACCOUNT_ID }}' \
             || deployment_failed=$?
           
