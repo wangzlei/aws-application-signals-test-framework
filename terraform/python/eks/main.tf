@@ -118,6 +118,12 @@ resource "kubernetes_deployment_v1" "python_app_deployment" {
           image_pull_policy = "Always"
           args              = ["sh", "-c", "python3 manage.py migrate --noinput && python3 manage.py collectstatic --noinput && python3 manage.py runserver 0.0.0.0:8000 --noreload"]
           env {
+            # Sample every trace: the account may only have the Default X-Ray rule (1/s + 5%),
+            # which drops the background-thread local-root client-call traces the validator needs.
+            name  = "OTEL_TRACES_SAMPLER"
+            value = "always_on"
+          }
+          env {
             #inject the test id to service name for unique App Signals metrics
             name  = "OTEL_SERVICE_NAME"
             value = "python-application-${var.test_id}"
