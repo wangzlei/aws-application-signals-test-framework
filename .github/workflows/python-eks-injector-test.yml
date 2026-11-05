@@ -397,8 +397,8 @@ jobs:
             if [ -n "${ld_preload}" ]; then echo "::error::old mode must not set LD_PRELOAD"; exit 1; fi
           else
             case "${ld_preload}" in
-              *libotelinject.so*) ;;
-              *) echo "::error::Injector mode ${effective} must set LD_PRELOAD to libotelinject.so"; exit 1 ;;
+              */otel-auto-instrumentation-python/injector/libotelinject.so*) ;;
+              *) echo "::error::Injector mode ${effective} must set LD_PRELOAD to the Python copy of libotelinject.so"; exit 1 ;;
             esac
           fi
 

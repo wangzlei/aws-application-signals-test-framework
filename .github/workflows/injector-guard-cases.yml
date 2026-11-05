@@ -200,7 +200,7 @@ jobs:
           echo "healthy: pod=${pod} restarts=${restarts} LD_PRELOAD=${ld_preload:-<unset>}"
           kubectl logs -n "${NAMESPACE}" "${pod}" -c app | tail -5
           [ "${restarts}" = 0 ] || { echo "::error::healthy app restarted ${restarts} times"; exit 1; }
-          case "${ld_preload}" in *libotelinject.so*) ;; *) echo "::error::healthy app was not injected through the Injector"; exit 1 ;; esac
+          case "${ld_preload}" in */otel-auto-instrumentation-python/injector/libotelinject.so*) ;; *) echo "::error::healthy app was not injected through the Injector"; exit 1 ;; esac
           if kubectl logs -n "${NAMESPACE}" "${pod}" -c app | grep -q "ADOT SDK skipped"; then
             echo "::error::the guard skipped the SDK for a healthy app"; exit 1
           fi
